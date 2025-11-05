@@ -89,6 +89,83 @@ export class ArtModeEndpoint extends BaseEndpoint {
         const { matte_type_list: types } = await this.request({ action: 'get_matte_list' })
         return JSON.parse(types).map(t => t.matte_type)
     }
+    async getThumbnail(contentId) {
+        const id = randomUUID()
+        // Request thumbnail via d2d socket mode
+        const { conn_info: connectionInfo } = await this.request({
+            action: 'get_thumbnail',
+            // eslint-disable-next-line camelcase
+            content_id: contentId,
+            // eslint-disable-next-line camelcase
+            conn_info: {
+                // eslint-disable-next-line camelcase
+                d2d_mode: 'socket',
+                // eslint-disable-next-line camelcase
+                connection_id: Math.floor(Math.random() * 4 * 1024 ** 3),
+                id,
+            },
+        })
+
+        // Parse connection info
+        const { ip: host, port, key: secKey } = JSON.parse(connectionInfo)
+
+        // Open d2d socket connection
+        const socket = new TLSSocket()
+        await new Promise(res => {
+            socket.connect({ host, port, rejectUnauthorized: false }, res)
+        })
+
+        // Read 4-byte header length (big-endian)
+        const headerLengthBuffer = await new Promise((resolve, reject) => {
+            const onData = (data) => {
+                socket.off('data', onData)
+                socket.off('error', reject)
+                resolve(data)
+            }
+            socket.once('data', onData)
+            socket.once('error', reject)
+        })
+        const headerLength = headerLengthBuffer.readUInt32BE(0)
+
+        // Read JSON header
+        let headerData = headerLengthBuffer.slice(4)
+        while (headerData.length < headerLength) {
+            const chunk = await new Promise((resolve, reject) => {
+                const onData = (data) => {
+                    socket.off('data', onData)
+                    socket.off('error', reject)
+                    resolve(data)
+                }
+                socket.once('data', onData)
+                socket.once('error', reject)
+            })
+            headerData = Buffer.concat([headerData, chunk])
+        }
+
+        const header = JSON.parse(headerData.slice(0, headerLength).toString('utf8'))
+        const thumbnailLength = header.fileLength
+
+        // Read thumbnail image data
+        let thumbnailData = headerData.slice(headerLength)
+        while (thumbnailData.length < thumbnailLength) {
+            const chunk = await new Promise((resolve, reject) => {
+                const onData = (data) => {
+                    socket.off('data', onData)
+                    socket.off('error', reject)
+                    resolve(data)
+                }
+                socket.once('data', onData)
+                socket.once('error', reject)
+            })
+            thumbnailData = Buffer.concat([thumbnailData, chunk])
+        }
+
+        // Close socket
+        await new Promise(res => socket.end(res))
+
+        // Return only the thumbnail data (first thumbnailLength bytes)
+        return thumbnailData.slice(0, thumbnailLength)
+    }
     async inArtMode() {
         const { value } = await this.request({ action: 'get_artmode_status' })
         return value === 'on'
