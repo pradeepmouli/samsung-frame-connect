@@ -8,16 +8,18 @@
     "test": "node --test  --experimental-test-coverage"
   },
   "main": "index.js",
+  "types": "index.d.ts",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/foxxyz/samsung-frame-connect.git"
+    "url": "git+https://github.com/pradeepmouli/samsung-frame-connect.git"
   },
   "author": "Ivo Janssen <hello@ivo.la>",
   "license": "LGPL-3.0-or-later",
   "devDependencies": {
     "@appliedminds/eslint-config": "^2.0.3",
     "eslint": "^9.36.0",
+    "type-fest": "^4.30.0",
     "undici": "^7.16.0"
   },
   "dependencies": {
