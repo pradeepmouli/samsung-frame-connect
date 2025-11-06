@@ -119,105 +119,139 @@ export class ArtModeEndpoint extends BaseEndpoint {
         // (Python reference: _send_art_request in samsungtvws/art.py)
         let response
         let connectionInfo
-        const timeout = setTimeout(() => {
-            throw new Error('Timeout waiting for d2d_service_message event')
-        }, this.connection.responseTimeout)
+        const timeoutMs = this.connection.responseTimeout || 10000
         
-        try {
-            // Keep reading WebSocket messages until we get d2d_service_message
-            while (true) {
-                const message = await new Promise((resolve, reject) => {
-                    const onMessage = (data) => {
-                        this.connection.socket.off('message', onMessage)
-                        this.connection.socket.off('error', reject)
-                        try {
-                            resolve(JSON.parse(data.toString()))
-                        } catch (e) {
-                            reject(new Error(`Failed to parse WebSocket message: ${e.message}`))
+        // Wrap event loop in a timeout promise
+        const eventLoopPromise = new Promise(async (resolve, reject) => {
+            const timeoutId = setTimeout(() => {
+                reject(new Error(`Timeout waiting for d2d_service_message event after ${timeoutMs}ms`))
+            }, timeoutMs)
+            
+            try {
+                // Keep reading WebSocket messages until we get d2d_service_message
+                while (true) {
+                    const wsMessage = await new Promise((msgResolve, msgReject) => {
+                        let resolved = false
+                        
+                        const onMessage = (data) => {
+                            if (resolved) return
+                            resolved = true
+                            this.connection.socket.removeListener('message', onMessage)
+                            this.connection.socket.removeListener('error', onError)
+                            try {
+                                msgResolve(JSON.parse(data.toString()))
+                            } catch (e) {
+                                msgReject(new Error(`Failed to parse WebSocket message: ${e.message}`))
+                            }
                         }
+                        
+                        const onError = (err) => {
+                            if (resolved) return
+                            resolved = true
+                            this.connection.socket.removeListener('message', onMessage)
+                            this.connection.socket.removeListener('error', onError)
+                            msgReject(err)
+                        }
+                        
+                        this.connection.socket.on('message', onMessage)
+                        this.connection.socket.on('error', onError)
+                    })
+                    
+                    // Check if this is the event we're waiting for
+                    if (wsMessage.event === 'd2d_service_message') {
+                        response = wsMessage
+                        break
                     }
-                    this.connection.socket.once('message', onMessage)
-                    this.connection.socket.once('error', reject)
-                })
-                
-                // Check if this is the event we're waiting for
-                if (message.event === 'd2d_service_message') {
-                    response = message
-                    break
+                    
+                    // Otherwise, continue loop to read next message
                 }
                 
-                // Otherwise, continue loop to read next message
+                clearTimeout(timeoutId)
+                
+                // Parse the response data
+                const data = JSON.parse(response.data)
+                connectionInfo = JSON.parse(data.conn_info)
+                resolve(connectionInfo)
+            } catch (error) {
+                clearTimeout(timeoutId)
+                reject(error)
             }
-            
-            clearTimeout(timeout)
-            
-            // Parse the response data
-            const data = JSON.parse(response.data)
-            connectionInfo = JSON.parse(data.conn_info)
-        } catch (error) {
-            clearTimeout(timeout)
-            throw error
-        }
+        })
+        
+        // Wait for connection info
+        connectionInfo = await eventLoopPromise
 
         const { ip: host, port } = connectionInfo
 
         // Open PLAIN socket connection (not TLS!) - this is critical
         const socket = new net.Socket()
+        socket.setNoDelay(true)
+        
         await new Promise((res, rej) => {
-            socket.connect(port, host, res)
+            socket.once('connect', res)
             socket.once('error', rej)
+            socket.connect(port, host)
         })
 
-        // Read 4-byte header length (big-endian)
-        const headerLengthBuffer = await new Promise((resolve, reject) => {
-            const onData = (data) => {
-                socket.off('data', onData)
-                socket.off('error', reject)
-                resolve(data)
+        try {
+            // Read 4-byte header length (big-endian)
+            const headerLengthBuffer = await new Promise((resolve, reject) => {
+                const onData = (data) => {
+                    socket.off('data', onData)
+                    socket.off('error', reject)
+                    resolve(data)
+                }
+                socket.once('data', onData)
+                socket.once('error', reject)
+            })
+            const headerLength = headerLengthBuffer.readUInt32BE(0)
+
+            // Read JSON header
+            let headerData = headerLengthBuffer.slice(4)
+            while (headerData.length < headerLength) {
+                const chunk = await new Promise((resolve, reject) => {
+                    const onData = (data) => {
+                        socket.off('data', onData)
+                        socket.off('error', reject)
+                        resolve(data)
+                    }
+                    socket.once('data', onData)
+                    socket.once('error', reject)
+                })
+                headerData = Buffer.concat([headerData, chunk])
             }
-            socket.once('data', onData)
-            socket.once('error', reject)
-        })
-        const headerLength = headerLengthBuffer.readUInt32BE(0)
 
-        // Read JSON header
-        let headerData = headerLengthBuffer.slice(4)
-        while (headerData.length < headerLength) {
-            const chunk = await new Promise((resolve, reject) => {
-                const onData = (data) => {
-                    socket.off('data', onData)
-                    socket.off('error', reject)
-                    resolve(data)
-                }
-                socket.once('data', onData)
-                socket.once('error', reject)
-            })
-            headerData = Buffer.concat([headerData, chunk])
+            const header = JSON.parse(headerData.slice(0, headerLength).toString('utf8'))
+            const thumbnailLength = header.fileLength
+
+            // Read thumbnail image data
+            let thumbnailData = headerData.slice(headerLength)
+            while (thumbnailData.length < thumbnailLength) {
+                const chunk = await new Promise((resolve, reject) => {
+                    const onData = (data) => {
+                        socket.off('data', onData)
+                        socket.off('error', reject)
+                        resolve(data)
+                    }
+                    socket.once('data', onData)
+                    socket.once('error', reject)
+                })
+                thumbnailData = Buffer.concat([thumbnailData, chunk])
+            }
+
+            // Close socket
+            socket.end()
+            await new Promise(res => socket.once('close', res))
+
+            // Return only the thumbnail data (first thumbnailLength bytes)
+            return thumbnailData.slice(0, thumbnailLength)
+        } catch (error) {
+            // Ensure socket is closed on error
+            if (!socket.destroyed) {
+                socket.destroy()
+            }
+            throw error
         }
-
-        const header = JSON.parse(headerData.slice(0, headerLength).toString('utf8'))
-        const thumbnailLength = header.fileLength
-
-        // Read thumbnail image data
-        let thumbnailData = headerData.slice(headerLength)
-        while (thumbnailData.length < thumbnailLength) {
-            const chunk = await new Promise((resolve, reject) => {
-                const onData = (data) => {
-                    socket.off('data', onData)
-                    socket.off('error', reject)
-                    resolve(data)
-                }
-                socket.once('data', onData)
-                socket.once('error', reject)
-            })
-            thumbnailData = Buffer.concat([thumbnailData, chunk])
-        }
-
-        // Close socket
-        await new Promise(res => socket.end(res))
-
-        // Return only the thumbnail data (first thumbnailLength bytes)
-        return thumbnailData.slice(0, thumbnailLength)
     }
     async inArtMode() {
         const { value } = await this.request({ action: 'get_artmode_status' })
