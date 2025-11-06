@@ -119,7 +119,7 @@ export class ArtModeEndpoint extends BaseEndpoint {
         // (Python reference: _send_art_request in samsungtvws/art.py)
         let response
         let connectionInfo
-        const timeoutMs = this.connection.responseTimeout || 10000
+        const timeoutMs = (this.connection.responseTimeout || 10) * 1000
         
         // Wrap event loop in a timeout promise
         const eventLoopPromise = new Promise(async (resolve, reject) => {
