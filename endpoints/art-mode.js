@@ -115,26 +115,25 @@ export class ArtModeEndpoint extends BaseEndpoint {
             }
         }
         
-        console.log(`[getThumbnail] Sending WebSocket message:`, JSON.stringify(message, null, 2))
+        console.log(`[getThumbnail] Sending WebSocket message for request_id: ${id}`)
         this.connection.socket.send(JSON.stringify(message))
         
-        // Implement event loop to wait for d2d_service_message event
-        // (Python reference: _send_art_request in samsungtvws/art.py)
+        // Implement event loop to wait for d2d_service_message event with matching request_id
         let response
         let connectionInfo
         const timeoutMs = 30000  // 30 seconds timeout
         
-        console.log(`[getThumbnail] Waiting for d2d_service_message with ${timeoutMs}ms timeout`)
+        console.log(`[getThumbnail] Waiting for d2d_service_message with matching request_id ${id}, timeout ${timeoutMs}ms`)
         
         // Wrap event loop in a timeout promise
         const eventLoopPromise = new Promise(async (resolve, reject) => {
             const timeoutId = setTimeout(() => {
-                console.log(`[getThumbnail] TIMEOUT after ${timeoutMs}ms waiting for d2d_service_message`)
+                console.log(`[getThumbnail] TIMEOUT after ${timeoutMs}ms waiting for d2d_service_message with request_id ${id}`)
                 reject(new Error(`Timeout waiting for d2d_service_message event after ${timeoutMs}ms`))
             }, timeoutMs)
             
             try {
-                // Keep reading WebSocket messages until we get d2d_service_message
+                // Keep reading WebSocket messages until we get d2d_service_message with our request_id
                 let messageCount = 0
                 while (true) {
                     const wsMessage = await new Promise((msgResolve, msgReject) => {
@@ -168,14 +167,31 @@ export class ArtModeEndpoint extends BaseEndpoint {
                         this.connection.socket.on('error', onError)
                     })
                     
-                    // Check if this is the event we're waiting for
+                    // Check if this is the event we're waiting for AND has matching request_id
                     if (wsMessage.event === 'd2d_service_message') {
-                        console.log(`[getThumbnail] Found d2d_service_message after ${messageCount} messages!`)
-                        response = wsMessage
-                        break
+                        console.log(`[getThumbnail] Found d2d_service_message, checking request_id...`)
+                        
+                        // Parse the data to check request_id
+                        let parsedData
+                        try {
+                            parsedData = JSON.parse(wsMessage.data)
+                            console.log(`[getThumbnail] Parsed data event: "${parsedData.event}", request_id: "${parsedData.request_id}"`)
+                        } catch (e) {
+                            console.error(`[getThumbnail] Failed to parse wsMessage.data:`, e.message)
+                            continue  // Skip this message, keep waiting
+                        }
+                        
+                        // Check if this response is for our request
+                        if (parsedData.request_id === id && parsedData.event === 'get_thumbnail') {
+                            console.log(`[getThumbnail] MATCH! Found get_thumbnail response for request_id ${id} after ${messageCount} messages`)
+                            response = wsMessage
+                            break
+                        } else {
+                            console.log(`[getThumbnail] Request ID mismatch or wrong event. Expected request_id="${id}" and event="get_thumbnail", got request_id="${parsedData.request_id}" and event="${parsedData.event}". Continuing to wait...`)
+                        }
+                    } else {
+                        console.log(`[getThumbnail] Not d2d_service_message (event="${wsMessage.event}"), continuing to wait...`)
                     }
-                    
-                    console.log(`[getThumbnail] Not the right event (${wsMessage.event}), continuing to wait...`)
                     // Otherwise, continue loop to read next message
                 }
                 
