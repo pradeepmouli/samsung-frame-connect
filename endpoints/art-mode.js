@@ -93,6 +93,8 @@ export class ArtModeEndpoint extends BaseEndpoint {
     async getThumbnail(contentId) {
         const id = randomUUID()
         
+        console.log(`[getThumbnail] Starting for contentId: ${contentId}, requestId: ${id}`)
+        
         // Manually send WebSocket message (not using request() because it waits for wrong event)
         const message = {
             method: 'ms.channel.emit',
@@ -113,22 +115,27 @@ export class ArtModeEndpoint extends BaseEndpoint {
             }
         }
         
+        console.log(`[getThumbnail] Sending WebSocket message:`, JSON.stringify(message, null, 2))
         this.connection.socket.send(JSON.stringify(message))
         
         // Implement event loop to wait for d2d_service_message event
         // (Python reference: _send_art_request in samsungtvws/art.py)
         let response
         let connectionInfo
-        const timeoutMs = (this.connection.responseTimeout || 10) * 1000
+        const timeoutMs = 30000  // 30 seconds timeout
+        
+        console.log(`[getThumbnail] Waiting for d2d_service_message with ${timeoutMs}ms timeout`)
         
         // Wrap event loop in a timeout promise
         const eventLoopPromise = new Promise(async (resolve, reject) => {
             const timeoutId = setTimeout(() => {
+                console.log(`[getThumbnail] TIMEOUT after ${timeoutMs}ms waiting for d2d_service_message`)
                 reject(new Error(`Timeout waiting for d2d_service_message event after ${timeoutMs}ms`))
             }, timeoutMs)
             
             try {
                 // Keep reading WebSocket messages until we get d2d_service_message
+                let messageCount = 0
                 while (true) {
                     const wsMessage = await new Promise((msgResolve, msgReject) => {
                         let resolved = false
@@ -139,8 +146,11 @@ export class ArtModeEndpoint extends BaseEndpoint {
                             this.connection.socket.removeListener('message', onMessage)
                             this.connection.socket.removeListener('error', onError)
                             try {
-                                msgResolve(JSON.parse(data.toString()))
+                                const parsed = JSON.parse(data.toString())
+                                console.log(`[getThumbnail] WebSocket message #${++messageCount} received:`, JSON.stringify(parsed, null, 2))
+                                msgResolve(parsed)
                             } catch (e) {
+                                console.error(`[getThumbnail] Failed to parse WebSocket message:`, e.message)
                                 msgReject(new Error(`Failed to parse WebSocket message: ${e.message}`))
                             }
                         }
@@ -150,6 +160,7 @@ export class ArtModeEndpoint extends BaseEndpoint {
                             resolved = true
                             this.connection.socket.removeListener('message', onMessage)
                             this.connection.socket.removeListener('error', onError)
+                            console.error(`[getThumbnail] WebSocket error:`, err)
                             msgReject(err)
                         }
                         
@@ -159,21 +170,27 @@ export class ArtModeEndpoint extends BaseEndpoint {
                     
                     // Check if this is the event we're waiting for
                     if (wsMessage.event === 'd2d_service_message') {
+                        console.log(`[getThumbnail] Found d2d_service_message after ${messageCount} messages!`)
                         response = wsMessage
                         break
                     }
                     
+                    console.log(`[getThumbnail] Not the right event (${wsMessage.event}), continuing to wait...`)
                     // Otherwise, continue loop to read next message
                 }
                 
                 clearTimeout(timeoutId)
                 
                 // Parse the response data
+                console.log(`[getThumbnail] Parsing response data...`)
                 const data = JSON.parse(response.data)
+                console.log(`[getThumbnail] Parsed response.data:`, JSON.stringify(data, null, 2))
                 connectionInfo = JSON.parse(data.conn_info)
+                console.log(`[getThumbnail] Connection info:`, JSON.stringify(connectionInfo, null, 2))
                 resolve(connectionInfo)
             } catch (error) {
                 clearTimeout(timeoutId)
+                console.error(`[getThumbnail] Error in event loop:`, error)
                 reject(error)
             }
         })
@@ -182,21 +199,27 @@ export class ArtModeEndpoint extends BaseEndpoint {
         connectionInfo = await eventLoopPromise
 
         const { ip: host, port } = connectionInfo
+        console.log(`[getThumbnail] Connecting d2d socket to ${host}:${port}`)
 
         // Open PLAIN socket connection (not TLS!) - this is critical
         const socket = new net.Socket()
         socket.setNoDelay(true)
         
         await new Promise((res, rej) => {
-            socket.once('connect', res)
+            socket.once('connect', () => {
+                console.log(`[getThumbnail] D2D socket connected`)
+                res()
+            })
             socket.once('error', rej)
             socket.connect(port, host)
         })
 
         try {
             // Read 4-byte header length (big-endian)
+            console.log(`[getThumbnail] Reading header length...`)
             const headerLengthBuffer = await new Promise((resolve, reject) => {
                 const onData = (data) => {
+                    console.log(`[getThumbnail] Received header length data: ${data.length} bytes`)
                     socket.off('data', onData)
                     socket.off('error', reject)
                     resolve(data)
@@ -205,12 +228,15 @@ export class ArtModeEndpoint extends BaseEndpoint {
                 socket.once('error', reject)
             })
             const headerLength = headerLengthBuffer.readUInt32BE(0)
+            console.log(`[getThumbnail] Header length: ${headerLength} bytes`)
 
             // Read JSON header
             let headerData = headerLengthBuffer.slice(4)
+            console.log(`[getThumbnail] Reading JSON header (${headerLength} bytes, already have ${headerData.length})...`)
             while (headerData.length < headerLength) {
                 const chunk = await new Promise((resolve, reject) => {
                     const onData = (data) => {
+                        console.log(`[getThumbnail] Received header chunk: ${data.length} bytes`)
                         socket.off('data', onData)
                         socket.off('error', reject)
                         resolve(data)
@@ -222,13 +248,17 @@ export class ArtModeEndpoint extends BaseEndpoint {
             }
 
             const header = JSON.parse(headerData.slice(0, headerLength).toString('utf8'))
+            console.log(`[getThumbnail] Parsed header:`, JSON.stringify(header, null, 2))
             const thumbnailLength = header.fileLength
+            console.log(`[getThumbnail] Thumbnail size: ${thumbnailLength} bytes`)
 
             // Read thumbnail image data
             let thumbnailData = headerData.slice(headerLength)
+            console.log(`[getThumbnail] Reading thumbnail data (${thumbnailLength} bytes, already have ${thumbnailData.length})...`)
             while (thumbnailData.length < thumbnailLength) {
                 const chunk = await new Promise((resolve, reject) => {
                     const onData = (data) => {
+                        console.log(`[getThumbnail] Received thumbnail chunk: ${data.length} bytes (total: ${thumbnailData.length + data.length}/${thumbnailLength})`)
                         socket.off('data', onData)
                         socket.off('error', reject)
                         resolve(data)
@@ -240,13 +270,19 @@ export class ArtModeEndpoint extends BaseEndpoint {
             }
 
             // Close socket
+            console.log(`[getThumbnail] Closing d2d socket...`)
             socket.end()
-            await new Promise(res => socket.once('close', res))
+            await new Promise(res => socket.once('close', () => {
+                console.log(`[getThumbnail] D2D socket closed`)
+                res()
+            }))
 
+            console.log(`[getThumbnail] Successfully retrieved thumbnail: ${thumbnailData.length} bytes`)
             // Return only the thumbnail data (first thumbnailLength bytes)
             return thumbnailData.slice(0, thumbnailLength)
         } catch (error) {
             // Ensure socket is closed on error
+            console.error(`[getThumbnail] D2D socket error:`, error)
             if (!socket.destroyed) {
                 socket.destroy()
             }
