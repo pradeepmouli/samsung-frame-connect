@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import net from 'node:net'
 import { TLSSocket } from 'node:tls'
 
 import { WSConnector } from '../connections/ws.js'
@@ -91,28 +92,80 @@ export class ArtModeEndpoint extends BaseEndpoint {
     }
     async getThumbnail(contentId) {
         const id = randomUUID()
-        // Request thumbnail via d2d socket mode
-        const { conn_info: connectionInfo } = await this.request({
-            action: 'get_thumbnail',
-            // eslint-disable-next-line camelcase
-            content_id: contentId,
-            // eslint-disable-next-line camelcase
-            conn_info: {
-                // eslint-disable-next-line camelcase
-                d2d_mode: 'socket',
-                // eslint-disable-next-line camelcase
-                connection_id: Math.floor(Math.random() * 4 * 1024 ** 3),
-                id,
-            },
-        })
+        
+        // Manually send WebSocket message (not using request() because it waits for wrong event)
+        const message = {
+            method: 'ms.channel.emit',
+            params: {
+                event: 'art_app_request',
+                to: 'host',
+                data: JSON.stringify({
+                    request_id: id,
+                    request: 'get_thumbnail',
+                    content_id: contentId,
+                    conn_info: {
+                        d2d_mode: 'socket',
+                        connection_id: Math.floor(Math.random() * 4 * 1024 ** 3),
+                        id,
+                    },
+                    id,
+                }),
+            }
+        }
+        
+        this.connection.socket.send(JSON.stringify(message))
+        
+        // Implement event loop to wait for d2d_service_message event
+        // (Python reference: _send_art_request in samsungtvws/art.py)
+        let response
+        let connectionInfo
+        const timeout = setTimeout(() => {
+            throw new Error('Timeout waiting for d2d_service_message event')
+        }, this.connection.responseTimeout)
+        
+        try {
+            // Keep reading WebSocket messages until we get d2d_service_message
+            while (true) {
+                const message = await new Promise((resolve, reject) => {
+                    const onMessage = (data) => {
+                        this.connection.socket.off('message', onMessage)
+                        this.connection.socket.off('error', reject)
+                        try {
+                            resolve(JSON.parse(data.toString()))
+                        } catch (e) {
+                            reject(new Error(`Failed to parse WebSocket message: ${e.message}`))
+                        }
+                    }
+                    this.connection.socket.once('message', onMessage)
+                    this.connection.socket.once('error', reject)
+                })
+                
+                // Check if this is the event we're waiting for
+                if (message.event === 'd2d_service_message') {
+                    response = message
+                    break
+                }
+                
+                // Otherwise, continue loop to read next message
+            }
+            
+            clearTimeout(timeout)
+            
+            // Parse the response data
+            const data = JSON.parse(response.data)
+            connectionInfo = JSON.parse(data.conn_info)
+        } catch (error) {
+            clearTimeout(timeout)
+            throw error
+        }
 
-        // Parse connection info
-        const { ip: host, port, key: secKey } = JSON.parse(connectionInfo)
+        const { ip: host, port } = connectionInfo
 
-        // Open d2d socket connection
-        const socket = new TLSSocket()
-        await new Promise(res => {
-            socket.connect({ host, port, rejectUnauthorized: false }, res)
+        // Open PLAIN socket connection (not TLS!) - this is critical
+        const socket = new net.Socket()
+        await new Promise((res, rej) => {
+            socket.connect(port, host, res)
+            socket.once('error', rej)
         })
 
         // Read 4-byte header length (big-endian)
