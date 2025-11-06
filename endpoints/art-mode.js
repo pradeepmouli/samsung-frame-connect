@@ -93,7 +93,7 @@ export class ArtModeEndpoint extends BaseEndpoint {
         const id = randomUUID()
         // Request thumbnail via d2d socket mode
         const { conn_info: connectionInfo } = await this.request({
-            request: 'get_thumbnail',
+            action: 'get_thumbnail',
             // eslint-disable-next-line camelcase
             content_id: contentId,
             // eslint-disable-next-line camelcase
